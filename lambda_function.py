@@ -29,14 +29,18 @@ def classify_aqi(aqi: int) -> str:
 
 
 def is_valid(record: dict) -> bool:
-    #Basic validation rule for the Transform stage.
     aqi = record.get("aqi")
     city = record.get("city")
     if city is None or str(city).strip() == "":
         return False
-    if not isinstance(aqi, (int, float)) or aqi < 0:
+    try:
+        aqi_val = int(aqi)
+        if aqi_val < 0:
+            return False
+    except (ValueError, TypeError):
         return False
     return True
+
 
 
 def transform(record: dict) -> dict:
