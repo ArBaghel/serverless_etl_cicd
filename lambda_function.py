@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 s3 = boto3.client("s3")
 dynamodb = boto3.resource("dynamodb")
 
-TABLE_NAME = os.environ.get("DYNAMODB_TABLE", "clean_records")
+TABLE_NAME = os.environ.get("DYNAMODB_TABLE", "clean_aq-_records")
 table = dynamodb.Table(TABLE_NAME)
 
 
