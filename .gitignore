@@ -1,0 +1,8 @@
+.env
+*.csv
+__pycache__/
+package/
+*.zip
+.ipynb_checkpoints/
+.DS_Store
+aqi_raw_*.json

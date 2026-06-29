@@ -1,0 +1,16 @@
+version: 0.2
+
+phases:
+  install:
+    runtime-versions:
+      python: 3.11
+  build:
+    commands:
+      - pip install -r requirements.txt || true
+      - python -m py_compile lambda_function.py
+      - echo "Build completed successfully on `date`"
+
+artifacts:
+  files:
+    - lambda_function.py
+    - requirements.txt
