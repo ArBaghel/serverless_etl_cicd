@@ -7,7 +7,7 @@ import boto3
 
 # ---- CONFIG ---------------------------------------------------------
 WAQI_TOKEN = "9e61f6da4928e57947fbe8e2652b25e93fe36d9c"  # your token
-CITIES = ["delhi", "mumbai", "bhopal", "rewa", "jabalpur"]
+CITIES = ["delhi", "mumbai", "bhopal", "gwalior", "jabalpur"]
 S3_BUCKET = "serverless-etl-aqi-pipeline"
 S3_RAW_KEY_PREFIX = "raw/"
 # ----------------------------------------------------------------------
