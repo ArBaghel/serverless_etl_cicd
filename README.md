@@ -1,123 +1,274 @@
-# Serverless ETL: Air Quality Index (AQI) Pipeline
+# Real-Time Air Quality ETL Pipeline (S3 → Lambda → DynamoDB)
 
-## 1. Project Title
-**Real-Time Air Quality ETL Pipeline (S3 → Lambda → DynamoDB)**
+A serverless ETL pipeline that fetches live Air Quality Index (AQI) readings from the WAQI API, stores raw data in S3, auto-triggers a Lambda function to clean and validate the data, and loads the results into DynamoDB — with full audit logging via CloudWatch.
 
-## 2. Dataset Source
-[World Air Quality Index Project (WAQI) API](https://aqicn.org/api/) — a free, real-world public API
-that provides live AQI readings for thousands of monitoring stations worldwide.
+---
 
-## 3. Scenario
-Air quality readings for a set of cities are fetched from the WAQI API, dropped into S3 as raw JSON,
-and automatically cleaned and loaded into DynamoDB so that the **latest validated AQI reading per
-city** is always queryable — the classic "weather / air quality: clean readings and store latest
-metrics" scenario from the assignment brief.
-
-## 4. Architecture Diagram
+## Architecture Overview
 
 ```
-WAQI API (third-party data source)
-        |
-        v
-fetch_and_upload.py  (local script)
-        |
-        v
-Amazon S3  (raw/ prefix)  --- S3:ObjectCreated event --->  AWS Lambda (lambda_function.py)
-                                                                  |
-                                                                  v
-                                                       Amazon DynamoDB (clean_records table)
-                                                                  |
-                                                                  v
-                                                       CloudWatch Logs (audit summary)
+┌─────────────────────┐
+│   WAQI Public API   │  (third-party data source)
+│  waqi.info/api/     │
+└────────┬────────────┘
+         │ HTTP GET (city AQI readings)
+         ▼
+┌─────────────────────┐
+│  fetch_and_upload   │  (local Python script)
+│       .py           │  Builds raw JSON/CSV → uploads to S3
+└────────┬────────────┘
+         │ s3.put_object()
+         ▼
+┌─────────────────────────────────────────┐
+│         Amazon S3                       │
+│   Bucket: serverless-etl-aqi-pipeline   │
+│   Prefix: raw/                          │
+│   ├── aqi_raw_*.json                    │
+│   └── city_aqi_data.csv                 │
+└────────┬────────────────────────────────┘
+         │ s3:ObjectCreated:Put event
+         │ (prefix: raw/, suffix: .csv / .json)
+         ▼
+┌─────────────────────┐
+│    AWS Lambda       │
+│  lambda_function.py │
+│  ┌───────────────┐  │
+│  │   Extract     │  │  Read raw file from S3
+│  │   Transform   │  │  Validate + clean + enrich
+│  │   Load        │  │  Write to DynamoDB
+│  │   Audit       │  │  Log summary to CloudWatch
+│  └───────────────┘  │
+└────────┬────────────┘
+         │
+    ┌────┴─────────────────────┐
+    │                          │
+    ▼                          ▼
+┌──────────────────┐   ┌──────────────────────┐
+│  Amazon DynamoDB │   │  Amazon CloudWatch   │
+│  clean_aqi_      │   │  Logs                │
+│  records table   │   │  AUDIT_SUMMARY log   │
+└──────────────────┘   └──────────────────────┘
 ```
 
-GitHub Actions validates code on every push. AWS CodePipeline pulls from GitHub and runs the same
-validation via CodeBuild, simulating a real CI/CD release process.
+---
 
-## 5. AWS Services Used
-- **Amazon S3** – stores raw AQI JSON files under `raw/`
-- **AWS Lambda** – runs the ETL (extract, transform, load, audit)
-- **Amazon DynamoDB** – stores clean records (`clean_records` table)
-- **AWS IAM** – least-privilege execution role for Lambda
-- **Amazon CloudWatch Logs** – Lambda execution logs + audit summary
-- **AWS CodePipeline + AWS CodeBuild** – CI/CD pipeline triggered from GitHub
-- **GitHub Actions** – pre-merge syntax/dependency validation
+## ETL Flow (inside Lambda)
 
-## 6. ETL Rules
-| Stage | Rule |
+```
+S3 Event Trigger
+      │
+      ▼
+┌─────────────────────────────┐
+│  EXTRACT                    │
+│  Read file from S3          │
+│  Detect format (.json/.csv) │
+│  Parse into list of dicts   │
+└────────────┬────────────────┘
+             │
+             ▼
+┌─────────────────────────────┐
+│  VALIDATE (per record)      │
+│  ┌──────────────────────┐   │
+│  │ city present?        │   │
+│  │ aqi is numeric?      │   │
+│  │ aqi >= 0?            │   │
+│  └──────┬───────────────┘   │
+│         │                   │
+│    Pass │        Fail       │
+│         │          │        │
+│         │     rejected++    │
+└─────────┼───────────────────┘
+          │
+          ▼
+┌─────────────────────────────────────────────┐
+│  TRANSFORM                                  │
+│  city   → Title Case (standardized)         │
+│  aqi    → int (type-safe)                   │
+│  pollutant → lowercase                      │
+│  aqi_category → derived (EPA classification)│
+│  record_id → city + timestamp + uuid suffix │
+└──────────────────┬──────────────────────────┘
+                   │
+                   ▼
+┌─────────────────────────────┐
+│  LOAD                       │
+│  DynamoDB.put_item()        │
+│  Table: clean_aqi_records   │
+│  PK: record_id (String)     │
+└──────────────────┬──────────┘
+                   │
+                   ▼
+┌─────────────────────────────────────────────┐
+│  AUDIT LOG → CloudWatch                     │
+│  {                                          │
+│    total_input_records: N,                  │
+│    inserted_records: N,                     │
+│    rejected_records: N,                     │
+│    timestamp: "2026-06-30T..."              │
+│  }                                          │
+└─────────────────────────────────────────────┘
+```
+
+---
+
+## AQI Classification (Derived Field)
+
+```
+AQI Value       →   aqi_category
+─────────────────────────────────────────────
+0   – 50        →   Good
+51  – 100       →   Moderate
+101 – 150       →   Unhealthy_for_Sensitive_Groups
+151 – 200       →   Unhealthy
+201 – 300       →   Very_Unhealthy
+301+            →   Hazardous
+```
+
+---
+
+## CI/CD Pipeline
+
+```
+Developer pushes code to GitHub
+          │
+          ├──────────────────────────────────┐
+          ▼                                  ▼
+┌─────────────────────┐          ┌───────────────────────┐
+│  GitHub Actions     │          │  AWS CodePipeline      │
+│  .github/workflows/ │          │                        │
+│  ci.yml             │          │  ┌──────────────────┐  │
+│                     │          │  │ Source Stage     │  │
+│  • Checkout repo    │          │  │ Pull from GitHub │  │
+│  • Setup Python 3.11│          │  └────────┬─────────┘  │
+│  • pip install deps │          │           │             │
+│  • py_compile check │          │           ▼             │
+│    lambda_function  │          │  ┌──────────────────┐  │
+│    fetch_and_upload │          │  │ Build Stage      │  │
+│                     │          │  │ CodeBuild runs   │  │
+│  ✅ Syntax valid?   │          │  │ buildspec.yml    │  │
+│  ❌ Fail on error   │          │  │ • pip install    │  │
+└─────────────────────┘          │  │ • py_compile     │  │
+                                 │  │ • Build artifact │  │
+                                 │  └──────────────────┘  │
+                                 └───────────────────────┘
+```
+
+---
+
+## Dataset
+
+**Source:** [World Air Quality Index Project (WAQI)](https://waqi.info/) — free public API providing live AQI readings for thousands of monitoring stations worldwide.
+
+**Cities monitored:** Major Dhyan Chand National Stadium (Delhi), Mumbai US Consulate, T T Nagar (Bhopal), Hyderabad US Consulate, Chennai US Consulate, Maninagar (Ahmedabad), Marhatal (Jabalpur), City Center (Gwalior), and more.
+
+---
+
+## AWS Services Used
+
+| Service | Role |
 |---|---|
-| Extract | Read the raw JSON array uploaded to `s3://<bucket>/raw/*.json` |
-| Transform | Reject records with empty `city` or non-numeric/negative `aqi`. Standardize `city` to Title Case and `aqi` to integer. Add derived field `aqi_category` (Good / Moderate / Unhealthy_for_Sensitive_Groups / Unhealthy / Very_Unhealthy / Hazardous) |
-| Load | `put_item` into DynamoDB with partition key `record_id` = `<city>_<reading_time>` |
-| Audit | Log `total_input_records`, `inserted_records`, `rejected_records`, `timestamp` to CloudWatch |
+| **Amazon S3** | Raw data lake — stores `.json` and `.csv` files under `raw/` prefix |
+| **AWS Lambda** | ETL engine — triggered on S3 PUT events, runs validate/transform/load |
+| **Amazon DynamoDB** | Clean record store — on-demand capacity, one item per city per reading |
+| **AWS IAM** | Least-privilege execution role for Lambda (`s3:GetObject`, `dynamodb:PutItem`) |
+| **Amazon CloudWatch Logs** | Audit trail — `AUDIT_SUMMARY` log line per Lambda execution |
+| **AWS CodePipeline** | CD — Source (GitHub) → Build (CodeBuild) on every push |
+| **AWS CodeBuild** | Runs `buildspec.yml`: install deps + compile check |
+| **GitHub Actions** | CI — pre-merge syntax validation on every push/PR |
 
-## 7. DynamoDB Table Design
-- **Table name:** `clean_records`
-- **Partition key:** `record_id` (String) — composite of city + reading timestamp, guarantees
-  uniqueness per city per reading and avoids overwriting historical data with each run.
-- **Capacity mode:** On-demand (no need to pre-provision throughput for a small/variable workload)
-- **Other attributes:** `city`, `aqi`, `dominant_pollutant`, `aqi_category`, `reading_time`, `ingested_at`
+---
 
-## 8. Testing Steps
-1. Run `python fetch_and_upload.py` locally — it calls the live WAQI API for each city in
-   `CITIES`, builds a raw JSON file, and uploads it to `s3://<bucket>/raw/`.
-2. Confirm the S3 PUT event triggers the Lambda function (check CloudWatch Logs).
-3. Confirm the `AUDIT_SUMMARY` log line shows the expected total/inserted/rejected counts
-   (a city lookup that fails or returns a non-`"ok"` status from WAQI is skipped by the
-   fetch script itself; any record that does reach S3 with an invalid/missing AQI or city is
-   rejected by Lambda's validation step — so the audit numbers reflect real, live-API conditions).
-4. Open the DynamoDB table and confirm clean items appear with correct `aqi_category` values.
-5. Push a code change to GitHub and confirm the GitHub Actions workflow passes.
-6. Confirm AWS CodePipeline runs Source → Build successfully after the same push.
+## DynamoDB Table Design
 
-## 9. GitHub Actions Summary
-`.github/workflows/ci.yml` runs on every push/PR: checks out the repo, sets up Python 3.11,
-installs dependencies, and runs `python -m py_compile` against `lambda_function.py` and
-`fetch_and_upload.py` to catch syntax errors before merge.
+**Table name:** `clean_aqi_records`  
+**Partition key:** `record_id` (String)  
+**Capacity mode:** On-demand
 
-## 10. AWS CodePipeline Summary
-The pipeline has two stages:
-1. **Source** – pulls the latest commit from the GitHub repository (via GitHub App connection).
-2. **Build** – AWS CodeBuild runs `buildspec.yml`, which installs dependencies and compiles
-   `lambda_function.py`, producing a build artifact containing the Lambda code.
+```
+record_id (PK)              │ city          │ aqi │ aqi_category  │ dominant_pollutant │ reading_time         │ ingested_at
+────────────────────────────┼───────────────┼─────┼───────────────┼────────────────────┼──────────────────────┼──────────────────────
+delhi_2026-06-30T..._a1b2   │ Delhi         │ 194 │ Unhealthy     │ pm10               │ 2026-06-30T18:00:00  │ 2026-06-30T14:15:03
+bhopal_2026-06-23T..._c3d4  │ T T Nagar,.. │  50 │ Good          │ pm25               │ 2026-06-23T10:00:00  │ 2026-06-30T14:15:03
+```
 
-## 11. Reflection Questions
+`record_id` is built from `city + reading_time + uuid suffix` to guarantee uniqueness across runs and prevent overwriting historical records.
 
-**Why did you choose DynamoDB for this project?**
-DynamoDB is a fully managed, serverless NoSQL database that fits naturally with a serverless
-Lambda pipeline — no servers to provision, scales automatically, and on-demand capacity mode
-means I only pay for the small number of writes this project generates.
+---
 
-**What is your partition key and why?**
-`record_id`, built from `city + reading_time`. This spreads writes across many distinct keys
-(good for DynamoDB performance) and keeps a full history of readings per city instead of
-overwriting the previous value every time the ETL runs.
+## ETL Validation Rules
 
-**What transformation rules did Lambda apply?**
-Rejects records with a missing city or a negative/non-numeric AQI; standardizes city name
-casing and AQI to integer type; derives a new `aqi_category` field from the AQI value.
+| Field | Rule | Action on Failure |
+|---|---|---|
+| `city` | Must be present and non-empty | Reject record |
+| `aqi` | Must be numeric and ≥ 0 | Reject record |
+| `aqi` (dash `-`) | Non-numeric string | Reject record |
+| Both valid | Proceed to transform | Insert to DynamoDB |
 
-**What did GitHub Actions validate?**
-That the Python files install their dependencies cleanly and compile without syntax errors,
-on every push/PR — a fast first line of defense before the heavier CodePipeline/CodeBuild stage.
+---
 
-**What did AWS CodePipeline do?**
-Automatically pulled the latest code from GitHub (Source stage) and ran the same dependency
-install + compile check via CodeBuild (Build stage), producing a deployable artifact.
+## Repository Structure
 
-**Which files should never be committed to GitHub and why?**
-`.env` files and any AWS access/secret keys (credential leakage risk), `*.zip` build artifacts
-(bloat, regenerable), `__pycache__/` (bytecode, regenerable), and raw `*.csv`/large raw datasets
-(can be large, often not meant for public sharing, and are regenerable from the source API).
-
-## 12. Repository Structure
 ```
 etl-s3-lambda-dynamodb/
-├── README.md
-├── lambda_function.py
-├── fetch_and_upload.py
-├── requirements.txt
-├── buildspec.yml
-├── screenshots/
-└── .github/workflows/ci.yml
+├── README.md                     # This file
+├── lambda_function.py            # ETL Lambda (extract, validate, transform, load, audit)
+├── fetch_and_upload.py           # Local script: fetch WAQI API → upload raw JSON to S3
+├── requirements.txt              # Python dependencies (boto3, requests)
+├── buildspec.yml                 # AWS CodeBuild build spec
+├── screenshots/                  # Evidence screenshots (S3, Lambda logs, DynamoDB)
+└── .github/
+    └── workflows/
+        └── ci.yml                # GitHub Actions: syntax check on push/PR
 ```
+
+---
+
+## Setup & Testing Steps
+
+### 1. Fetch and Upload Raw Data
+```bash
+python fetch_and_upload.py
+```
+Calls the WAQI API for each configured city, writes a timestamped JSON file, and uploads it to `s3://<bucket>/raw/`.
+
+### 2. Verify S3 Trigger Fires
+Check the S3 bucket event notification is configured:
+- **Prefix:** `raw/`
+- **Suffix:** `.csv` or `.json`
+- **Event type:** `s3:ObjectCreated:Put`
+
+### 3. Check CloudWatch Logs
+After upload, Lambda fires automatically. Verify in CloudWatch:
+```json
+AUDIT_SUMMARY: {
+  "total_input_records": 8,
+  "inserted_records": 7,
+  "rejected_records": 1,
+  "timestamp": "2026-06-30T14:15:03Z"
+}
+```
+
+### 4. Verify DynamoDB Records
+Open DynamoDB → Tables → `clean_aqi_records` → **Explore table items**.  
+Confirm records appear with `aqi_category` populated correctly.
+
+### 5. Test CI/CD
+Push any code change to GitHub:
+- GitHub Actions runs syntax validation automatically
+- AWS CodePipeline triggers Source → Build stages
+
+---
+
+## Reflection
+
+**Why DynamoDB?**  
+Fully managed and serverless — fits naturally with a Lambda-based pipeline. No servers to provision, scales automatically, and on-demand capacity means you only pay for the writes this project generates.
+
+**Why this partition key?**  
+`record_id = city + reading_time + uuid` spreads writes across many distinct keys (good for DynamoDB hot-partition avoidance) and preserves the full history of readings per city instead of overwriting previous values on each ETL run.
+
+**What transformations does Lambda apply?**  
+Rejects records with missing city or invalid AQI; normalizes city name to Title Case and AQI to integer; derives `aqi_category` from the EPA AQI scale; adds `ingested_at` timestamp.
+
+**What files should never be committed to GitHub?**  
+`.env` files and AWS credentials (leak risk), `*.zip` build artifacts (regenerable), `__pycache__/` (bytecode), and large raw `.csv` / `.json` datasets (regenerable from the API).
