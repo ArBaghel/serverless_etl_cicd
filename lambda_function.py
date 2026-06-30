@@ -3,6 +3,7 @@ import io
 import json
 import os
 import boto3
+import uuid
 from datetime import datetime, timezone
  
 s3 = boto3.client("s3")
@@ -50,7 +51,7 @@ def transform(record: dict) -> dict:
     pollutant = str(record.get("dominant_pollutant", "unknown")).lower()
     timestamp = record.get("time") or datetime.now(timezone.utc).isoformat()
  
-    record_id = f"{city_clean.lower().replace(' ', '_')}_{timestamp}"
+    record_id = f"{city_clean.lower().replace(' ', '_')}_{timestamp}_{uuid.uuid4().hex[:8]}"
  
     return {
         "record_id": record_id,                # partition key
